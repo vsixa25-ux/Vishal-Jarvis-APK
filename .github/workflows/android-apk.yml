@@ -60,7 +60,7 @@ jobs:
           )
 
           if ($archives.Count -ne 1) {
-            throw "Repository root-এ ঠিক একটি ZIP ফাইল থাকতে হবে। পাওয়া গেছে: $($archives.Count)"
+            throw "Exactly one source ZIP is required."
           }
 
           $destination = Join-Path `
@@ -115,7 +115,7 @@ jobs:
           }
 
           if ($projects.Count -ne 1) {
-            throw "build:android script-সহ ঠিক একটি project প্রয়োজন। পাওয়া গেছে: $($projects.Count)"
+            throw "Exactly one project with build:android is required."
           }
 
           $project = $projects[0]
@@ -125,30 +125,32 @@ jobs:
             "scripts\build-android.ps1"
 
           if (!(Test-Path -LiteralPath $buildScript -PathType Leaf)) {
-            throw "scripts/build-android.ps1 পাওয়া যায়নি।"
+            throw "scripts/build-android.ps1 not found."
           }
 
-          $javaFile = Join-Path `
-            $project `
-            "androidappsrcmainjavacommyraamobileLiveVoiceService.java"
+          $javaFiles = @(
+            Get-ChildItem `
+              -LiteralPath $project `
+              -Filter "*.java" `
+              -File `
+              -Recurse
+          )
 
-          if (Test-Path -LiteralPath $javaFile -PathType Leaf) {
-            $javaSource = Get-Content `
-              -LiteralPath $javaFile `
+          foreach ($javaFile in $javaFiles) {
+            $source = Get-Content `
+              -LiteralPath $javaFile.FullName `
               -Raw
 
-            $javaSource = $javaSource -replace `
-              's*.setSilent(true)', ''
+            $source = $source -replace `
+              's*.setSilents*(s*trues*)', ''
 
             Set-Content `
-              -LiteralPath $javaFile `
-              -Value $javaSource `
+              -LiteralPath $javaFile.FullName `
+              -Value $source `
               -Encoding UTF8
           }
 
           "JARVIS_PROJECT=$project" >> $env:GITHUB_ENV
-
-          Write-Host "Project found: $project"
 
       - name: Install project dependencies
         shell: pwsh
@@ -168,7 +170,7 @@ jobs:
           }
 
           if ($LASTEXITCODE -ne 0) {
-            throw "NPM dependency installation failed."
+            throw "Project dependency installation failed."
           }
 
       - name: Build Android APK
@@ -184,64 +186,50 @@ jobs:
             throw "Android APK build failed."
           }
 
-      - name: Locate and verify APK
+      - name: Find APK
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $expectedApk = Join-Path `
-            $env:JARVIS_PROJECT `
-            "artifactsandroidVishal-Jarvis-1.1.1-private.apk"
+          $apkFiles = @(
+            Get-ChildItem `
+              -LiteralPath $env:JARVIS_PROJECT `
+              -Filter "*.apk" `
+              -File `
+              -Recurse |
+            Where-Object {
+              $_.FullName -notmatch `
+                '[\\/](node_modules|.git)[\\/]' -and
+              $_.FullName -match `
+                '[\\/](artifacts[\\/]android|build[\\/]outputs[\\/]apk)[\\/]'
+            } |
+            Sort-Object LastWriteTime -Descending
+          )
 
-          if (Test-Path -LiteralPath $expectedApk -PathType Leaf) {
-            $apk = Get-Item -LiteralPath $expectedApk
+          if ($apkFiles.Count -eq 0) {
+            throw "No APK file was generated."
           }
-          else {
-            $apkCandidates = @(
-              Get-ChildItem `
-                -LiteralPath $env:JARVIS_PROJECT `
-                -Filter "*.apk" `
-                -File `
-                -Recurse |
-              Where-Object {
-                $_.FullName -notmatch `
-                  '[\\/](node_modules|.git)[\\/]' -and
-                $_.FullName -match `
-                  '[\\/](artifacts[\\/]android|build[\\/]outputs[\\/]apk)[\\/]'
-              } |
-              Sort-Object LastWriteTime -Descending
-            )
 
-            if ($apkCandidates.Count -eq 0) {
-              throw "কোনো APK পাওয়া যায়নি।"
-            }
-
-            $apk = $apkCandidates[0]
-          }
+          $apk = $apkFiles[0]
 
           if ($apk.Length -le 0) {
-            throw "APK ফাইলটি খালি।"
+            throw "Generated APK is empty."
           }
 
-          Write-Host "APK: $($apk.FullName)"
-          Write-Host "APK size: $($apk.Length) bytes"
-
-          $hash = Get-FileHash `
-            -LiteralPath $apk.FullName `
-            -Algorithm SHA256
-
-          Write-Host "SHA256: $($hash.Hash)"
-
-          $apkOutput = Join-Path `
+          $output = Join-Path `
             $env:RUNNER_TEMP `
             "Vishal-Jarvis-Android.apk"
 
           Copy-Item `
             -LiteralPath $apk.FullName `
-            -Destination $apkOutput `
+            -Destination $output `
             -Force
 
-          "APK_OUTPUT=$apkOutput" >> $env:GITHUB_ENV
+          Get-FileHash `
+            -LiteralPath $output `
+            -Algorithm SHA256
+
+          "APK_OUTPUT=$output" >> $env:GITHUB_ENV
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
