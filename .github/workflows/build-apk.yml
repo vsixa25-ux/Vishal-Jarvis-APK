@@ -1,0 +1,179 @@
+
+name: Vishal Jarvis - Android APK Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Vishal Jarvis APK
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configure Android SDK
+        shell: pwsh
+        run: |
+          $sdkRoot = $env:ANDROID_HOME
+
+          if (!$sdkRoot -or !(Test-Path $sdkRoot)) {
+            $sdkRoot = "C:\Android\android-sdk"
+          }
+
+          if (!(Test-Path $sdkRoot)) {
+            throw "Android SDK installation not found."
+          }
+
+          $sdkmanager = Get-ChildItem `
+            -Path "$sdkRoot\cmdline-tools" `
+            -Filter "sdkmanager.bat" `
+            -Recurse |
+            Select-Object -First 1
+
+          if (!$sdkmanager) {
+            throw "Android SDK Manager not found."
+          }
+
+          $env:ANDROID_HOME = $sdkRoot
+          $env:ANDROID_SDK_ROOT = $sdkRoot
+
+          "ANDROID_HOME=$sdkRoot" >> $env:GITHUB_ENV
+          "ANDROID_SDK_ROOT=$sdkRoot" >> $env:GITHUB_ENV
+
+          # Accept SDK licenses without interactive prompts.
+          $answers = ("y`n" * 100)
+
+          $answers | & $sdkmanager.FullName --licenses
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Android SDK license acceptance failed."
+          }
+
+          # Install only the packages required by this project.
+          & $sdkmanager.FullName --install `
+            "platforms;android-35" `
+            "build-tools;35.0.0"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Android SDK package installation failed."
+          }
+
+      - name: Extract Jarvis source
+        shell: pwsh
+        run: |
+          $workspace = $env:GITHUB_WORKSPACE
+
+          $archives = @(
+            Get-ChildItem -Path $workspace -Filter "*.zip" -File
+          )
+
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one source ZIP in repository root. Found: $($archives.Count)"
+          }
+
+          $destination = Join-Path $env:RUNNER_TEMP "jarvis-source"
+
+          New-Item -ItemType Directory `
+            -Path $destination -Force | Out-Null
+
+          Expand-Archive `
+            -LiteralPath $archives[0].FullName `
+            -DestinationPath $destination `
+            -Force
+
+          $packageFiles = @(
+            Get-ChildItem -Path $destination `
+              -Filter "package.json" -File -Recurse
+          )
+
+          $project = $null
+
+          foreach ($file in $packageFiles) {
+            $package = Get-Content $file.FullName -Raw |
+              ConvertFrom-Json
+
+            if ($package.scripts.'build:android') {
+              $project = $file.DirectoryName
+              break
+            }
+          }
+
+          if (!$project) {
+            throw "Android project with build:android script was not found."
+          }
+
+          if (!(Test-Path "$project\scripts\build-android.ps1")) {
+            throw "Android build script is missing."
+          }
+
+          "JARVIS_PROJECT=$project" >> $env:GITHUB_ENV
+
+          Write-Host "Jarvis project found: $project"
+
+      - name: Install project dependencies
+        shell: pwsh
+        run: |
+          Set-Location $env:JARVIS_PROJECT
+
+          npm install --no-audit --no-fund
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "NPM dependency installation failed."
+          }
+
+      - name: Build Android APK
+        shell: pwsh
+        run: |
+          Set-Location $env:JARVIS_PROJECT
+
+          npm run build:android
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Vishal Jarvis Android compilation failed."
+          }
+
+      - name: Verify APK
+        shell: pwsh
+        run: |
+          $apk = Join-Path $env:JARVIS_PROJECT `
+            "artifacts\android\Vishal-Jarvis-1.1.1-private.apk"
+
+          if (!(Test-Path $apk)) {
+            throw "Expected APK was not generated."
+          }
+
+          $size = (Get-Item $apk).Length
+
+          if ($size -le 0) {
+            throw "Generated APK is empty."
+          }
+
+          Write-Host "APK successfully generated."
+          Write-Host "APK Size: $size bytes"
+
+          Get-FileHash $apk -Algorithm SHA256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vishal-Jarvis-Android-APK
+          path: ${{ runner.temp }}/jarvis-source/**/artifacts/android/Vishal-Jarvis-1.1.1-private.apk
+          if-no-files-found: error
+          retention-days: 7
