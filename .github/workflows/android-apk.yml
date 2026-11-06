@@ -31,7 +31,6 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          cmdline-tools-version: "14742923"
           accept-android-sdk-licenses: true
 
       - name: Install Android SDK packages
@@ -48,25 +47,20 @@ jobs:
             throw "Android SDK package installation failed."
           }
 
-      - name: Find and extract source ZIP
+      - name: Extract source ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $workspace = $env:GITHUB_WORKSPACE
-
           $archives = @(
             Get-ChildItem `
-              -LiteralPath $workspace `
+              -LiteralPath $env:GITHUB_WORKSPACE `
               -Filter "*.zip" `
               -File
           )
 
           if ($archives.Count -ne 1) {
-            throw (
-              "Repository root-এ ঠিক একটি ZIP থাকতে হবে। " +
-              "পাওয়া গেছে: $($archives.Count)"
-            )
+            throw "Repository root-এ ঠিক একটি ZIP ফাইল থাকতে হবে। পাওয়া গেছে: $($archives.Count)"
           }
 
           $destination = Join-Path `
@@ -80,6 +74,12 @@ jobs:
               -Force
           }
 
+          New-Item `
+            -ItemType Directory `
+            -Path $destination `
+            -Force |
+            Out-Null
+
           Expand-Archive `
             -LiteralPath $archives[0].FullName `
             -DestinationPath $destination `
@@ -87,11 +87,13 @@ jobs:
 
           $projects = @()
 
-          $packageFiles = Get-ChildItem `
-            -LiteralPath $destination `
-            -Filter "package.json" `
-            -File `
-            -Recurse
+          $packageFiles = @(
+            Get-ChildItem `
+              -LiteralPath $destination `
+              -Filter "package.json" `
+              -File `
+              -Recurse
+          )
 
           foreach ($file in $packageFiles) {
             try {
@@ -113,10 +115,7 @@ jobs:
           }
 
           if ($projects.Count -ne 1) {
-            throw (
-              "build:android script-সহ ঠিক একটি project দরকার। " +
-              "পাওয়া গেছে: $($projects.Count)"
-            )
+            throw "build:android script-সহ ঠিক একটি project প্রয়োজন। পাওয়া গেছে: $($projects.Count)"
           }
 
           $project = $projects[0]
@@ -125,15 +124,33 @@ jobs:
             $project `
             "scripts\build-android.ps1"
 
-          if (!(Test-Path -LiteralPath $buildScript)) {
-            throw "ফাইলটি পাওয়া যায়নি: $buildScript"
+          if (!(Test-Path -LiteralPath $buildScript -PathType Leaf)) {
+            throw "scripts/build-android.ps1 পাওয়া যায়নি।"
+          }
+
+          $javaFile = Join-Path `
+            $project `
+            "androidappsrcmainjavacommyraamobileLiveVoiceService.java"
+
+          if (Test-Path -LiteralPath $javaFile -PathType Leaf) {
+            $javaSource = Get-Content `
+              -LiteralPath $javaFile `
+              -Raw
+
+            $javaSource = $javaSource -replace `
+              's*.setSilent(true)', ''
+
+            Set-Content `
+              -LiteralPath $javaFile `
+              -Value $javaSource `
+              -Encoding UTF8
           }
 
           "JARVIS_PROJECT=$project" >> $env:GITHUB_ENV
 
           Write-Host "Project found: $project"
 
-      - name: Install Node dependencies
+      - name: Install project dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -151,10 +168,10 @@ jobs:
           }
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Node dependencies install হয়নি।"
+            throw "NPM dependency installation failed."
           }
 
-      - name: Build Vishal Jarvis APK
+      - name: Build Android APK
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -167,36 +184,69 @@ jobs:
             throw "Android APK build failed."
           }
 
-      - name: Verify APK
+      - name: Locate and verify APK
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $apk = Join-Path `
+          $expectedApk = Join-Path `
             $env:JARVIS_PROJECT `
             "artifactsandroidVishal-Jarvis-1.1.1-private.apk"
 
-          if (!(Test-Path -LiteralPath $apk)) {
-            throw "APK পাওয়া যায়নি: $apk"
+          if (Test-Path -LiteralPath $expectedApk -PathType Leaf) {
+            $apk = Get-Item -LiteralPath $expectedApk
+          }
+          else {
+            $apkCandidates = @(
+              Get-ChildItem `
+                -LiteralPath $env:JARVIS_PROJECT `
+                -Filter "*.apk" `
+                -File `
+                -Recurse |
+              Where-Object {
+                $_.FullName -notmatch `
+                  '[\\/](node_modules|.git)[\\/]' -and
+                $_.FullName -match `
+                  '[\\/](artifacts[\\/]android|build[\\/]outputs[\\/]apk)[\\/]'
+              } |
+              Sort-Object LastWriteTime -Descending
+            )
+
+            if ($apkCandidates.Count -eq 0) {
+              throw "কোনো APK পাওয়া যায়নি।"
+            }
+
+            $apk = $apkCandidates[0]
           }
 
-          $size = (Get-Item -LiteralPath $apk).Length
-
-          if ($size -le 0) {
+          if ($apk.Length -le 0) {
             throw "APK ফাইলটি খালি।"
           }
 
-          Write-Host "APK successfully generated."
-          Write-Host "APK size: $size bytes"
+          Write-Host "APK: $($apk.FullName)"
+          Write-Host "APK size: $($apk.Length) bytes"
 
-          Get-FileHash `
-            -LiteralPath $apk `
+          $hash = Get-FileHash `
+            -LiteralPath $apk.FullName `
             -Algorithm SHA256
+
+          Write-Host "SHA256: $($hash.Hash)"
+
+          $apkOutput = Join-Path `
+            $env:RUNNER_TEMP `
+            "Vishal-Jarvis-Android.apk"
+
+          Copy-Item `
+            -LiteralPath $apk.FullName `
+            -Destination $apkOutput `
+            -Force
+
+          "APK_OUTPUT=$apkOutput" >> $env:GITHUB_ENV
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Vishal-Jarvis-Android-APK
-          path: ${{ runner.temp }}/jarvis-source/**/artifacts/android/Vishal-Jarvis-1.1.1-private.apk
+          path: ${{ runner.temp }}/Vishal-Jarvis-Android.apk
           if-no-files-found: error
           retention-days: 7
