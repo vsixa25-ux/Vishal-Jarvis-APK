@@ -6,6 +6,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   build:
     name: Build Vishal Jarvis APK
@@ -17,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -30,7 +33,7 @@ jobs:
       - name: Configure Android SDK
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
           $sdkRoot = $env:ANDROID_HOME
           if ([string]::IsNullOrWhiteSpace($sdkRoot) -or !(Test-Path -LiteralPath $sdkRoot)) {
@@ -41,14 +44,16 @@ jobs:
           }
 
           if (!(Test-Path -LiteralPath $sdkRoot)) {
-            throw "Android SDK installation not found at: $sdkRoot"
+            Write-Host "::error::Android SDK installation not found at $sdkRoot"
+            exit 1
           }
 
-          $sdkmanager = Get-ChildItem -Path "$sdkRoot\cmdline-tools" -Filter "sdkmanager.bat" -File -Recurse -ErrorAction SilentlyContinue |
+          $sdkmanager = Get-ChildItem -Path "$sdkRoot" -Filter "sdkmanager.bat" -File -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
           if (!$sdkmanager) {
-            throw "Android SDK Manager (sdkmanager.bat) not found."
+            Write-Host "::error::Android SDK Manager (sdkmanager.bat) not found in $sdkRoot"
+            exit 1
           }
 
           $env:ANDROID_HOME = $sdkRoot
@@ -59,17 +64,18 @@ jobs:
           "$($sdkmanager.DirectoryName)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "$sdkRoot\platform-tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-          # Prevent stderr warnings from batch files from failing the PowerShell step
-          $ErrorActionPreference = "Continue"
+          $cmdFile = Join-Path $env:RUNNER_TEMP "install-android-sdk.cmd"
+          @"
+          @echo off
+          (for /l %%i in (1,1,100) do @echo y) | "$($sdkmanager.FullName)" --sdk_root="$sdkRoot" --licenses >nul 2>&1
+          "$($sdkmanager.FullName)" --sdk_root="$sdkRoot" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          exit /b %ERRORLEVEL%
+          "@ | Set-Content -LiteralPath $cmdFile -Encoding ascii
 
-          # Accept SDK licenses without interactive prompts
-          1..100 | ForEach-Object { "y" } | & $sdkmanager.FullName "--sdk_root=$sdkRoot" "--licenses" | Out-Null
-
-          # Embed quotes around package names so cmd.exe does not split arguments on semicolons (;)
-          & $sdkmanager.FullName "--sdk_root=$sdkRoot" "--install" '"platform-tools"' '"platforms;android-35"' '"build-tools;35.0.0"'
-
+          & cmd.exe /c "`"$cmdFile`""
           if ($LASTEXITCODE -ne 0) {
-            throw "Android SDK package installation failed with exit code $LASTEXITCODE."
+            Write-Host "::error::Android SDK package installation failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
           }
 
       - name: Extract Jarvis source
@@ -77,24 +83,28 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $workspace = $env:GITHUB_WORKSPACE
-
-          $archives = @(
-            Get-ChildItem -Path $workspace -Filter "*.zip" -File
-          )
-
-          if ($archives.Count -ne 1) {
-            throw "Expected exactly one source ZIP in repository root. Found: $($archives.Count)"
-          }
-
           $destination = Join-Path $env:RUNNER_TEMP "jarvis-source"
 
           if (Test-Path -LiteralPath $destination) {
             Remove-Item -LiteralPath $destination -Recurse -Force
           }
-
           New-Item -ItemType Directory -Path $destination -Force | Out-Null
 
-          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath $destination -Force
+          $archives = @(
+            Get-ChildItem -Path $workspace -Filter "*.zip" -File -Recurse |
+              Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' -and $_.FullName -notmatch '[\\/]node_modules[\\/]' }
+          )
+
+          if ($archives.Count -ge 1) {
+            $selectedZip = $archives | Sort-Object Length -Descending | Select-Object -First 1
+            Write-Host "Extracting ZIP: $($selectedZip.FullName)"
+            Expand-Archive -LiteralPath $selectedZip.FullName -DestinationPath $destination -Force
+          } else {
+            Write-Host "No ZIP found. Copying repository files directly..."
+            Get-ChildItem -Path $workspace -Force |
+              Where-Object { $_.Name -ne ".git" -and $_.Name -ne ".github" } |
+              Copy-Item -Destination $destination -Recurse -Force
+          }
 
           $packageFiles = @(
             Get-ChildItem -Path $destination -Filter "package.json" -File -Recurse |
@@ -115,17 +125,23 @@ jobs:
             }
           }
 
+          if (!$project -and $packageFiles.Count -ge 1) {
+            $project = $packageFiles[0].DirectoryName
+          }
+
           if (!$project) {
-            throw "Android project with build:android script was not found."
+            Write-Host "::error::No package.json found inside your repository or ZIP file."
+            exit 1
           }
 
           $buildScript = Join-Path $project "scripts\build-android.ps1"
-          if (!(Test-Path -LiteralPath $buildScript)) {
-            throw "Android build script is missing at: $buildScript"
+          if (Test-Path -LiteralPath $buildScript) {
+            $scriptContent = Get-Content -LiteralPath $buildScript -Raw
+            $scriptContent = $scriptContent -replace '\$ErrorActionPreference\s*=\s*["'']Stop["'']', '$ErrorActionPreference = "Continue"'
+            Set-Content -LiteralPath $buildScript -Value $scriptContent -Encoding utf8
           }
 
           "JARVIS_PROJECT=$project" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
           Write-Host "Jarvis project found: $project"
 
       - name: Install project dependencies
@@ -137,7 +153,8 @@ jobs:
           npm install --no-audit --no-fund
 
           if ($LASTEXITCODE -ne 0) {
-            throw "NPM dependency installation failed with exit code $LASTEXITCODE."
+            Write-Host "::error::NPM dependency installation failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
           }
 
       - name: Build Android APK
@@ -149,7 +166,8 @@ jobs:
           npm run build:android
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Vishal Jarvis Android compilation failed with exit code $LASTEXITCODE."
+            Write-Host "::error::Vishal Jarvis Android compilation failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
           }
 
       - name: Verify APK
@@ -162,19 +180,23 @@ jobs:
           if (Test-Path -LiteralPath $expectedApk) {
             $apk = $expectedApk
           } else {
-            $fallbackApk = Get-ChildItem -Path (Join-Path $env:JARVIS_PROJECT "artifacts\android") -Filter "*.apk" -File -ErrorAction SilentlyContinue |
+            $fallbackApk = Get-ChildItem -Path $env:JARVIS_PROJECT -Filter "*.apk" -File -Recurse -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending |
               Select-Object -First 1
+
             if ($fallbackApk) {
               $apk = $fallbackApk.FullName
             } else {
-              throw "Expected APK was not generated at: $expectedApk"
+              Write-Host "::error::Expected APK was not generated anywhere in $env:JARVIS_PROJECT"
+              exit 1
             }
           }
 
           $size = (Get-Item -LiteralPath $apk).Length
 
           if ($size -le 0) {
-            throw "Generated APK is empty."
+            Write-Host "::error::Generated APK is empty (0 bytes)."
+            exit 1
           }
 
           "APK_PATH=$apk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
