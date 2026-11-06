@@ -1,3 +1,4 @@
+
 name: Vishal Jarvis - Android APK Build
 
 on:
@@ -128,6 +129,7 @@ jobs:
             throw "scripts/build-android.ps1 not found."
           }
 
+          # Correct Java source patching
           $javaFiles = @(
             Get-ChildItem `
               -LiteralPath $project `
@@ -137,20 +139,26 @@ jobs:
           )
 
           foreach ($javaFile in $javaFiles) {
+
             $source = Get-Content `
               -LiteralPath $javaFile.FullName `
               -Raw
 
+            # Correct regex: matches .setSilent(true)
             $source = $source -replace `
-              's*.setSilents*(s*trues*)', ''
+              '\s*\.\s*setSilent\s*\(\s*true\s*\)', ''
 
-            Set-Content `
-              -LiteralPath $javaFile.FullName `
-              -Value $source `
-              -Encoding UTF8
+            [System.IO.File]::WriteAllText(
+              $javaFile.FullName,
+              $source,
+              [System.Text.UTF8Encoding]::new($false)
+            )
           }
 
           "JARVIS_PROJECT=$project" >> $env:GITHUB_ENV
+
+          Write-Host "Project detected: $project"
+          Write-Host "Java files processed: $($javaFiles.Count)"
 
       - name: Install project dependencies
         shell: pwsh
@@ -180,11 +188,34 @@ jobs:
 
           Set-Location -LiteralPath $env:JARVIS_PROJECT
 
-          npm run build:android
+          $buildLog = Join-Path `
+            $env:RUNNER_TEMP `
+            "android-build.log"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Android APK build failed."
+          Write-Host "Starting Android build..."
+
+          & npm run build:android 2>&1 |
+            Tee-Object -FilePath $buildLog
+
+          $buildExitCode = $LASTEXITCODE
+
+          if ($buildExitCode -ne 0) {
+            Write-Host "Android compilation failed."
+            Write-Host "Build log: $buildLog"
+
+            throw "Android Java compilation/build failed. Exit code: $buildExitCode"
           }
+
+          Write-Host "Android build completed successfully."
+
+      - name: Upload build diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vishal-Jarvis-Build-Log
+          path: ${{ runner.temp }}/android-build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Find APK
         shell: pwsh
@@ -199,7 +230,7 @@ jobs:
               -Recurse |
             Where-Object {
               $_.FullName -notmatch `
-                '[\\/](node_modules|.git)[\\/]' -and
+                '[\\/](node_modules|\.git)[\\/]' -and
               $_.FullName -match `
                 '[\\/](artifacts[\\/]android|build[\\/]outputs[\\/]apk)[\\/]'
             } |
@@ -230,6 +261,8 @@ jobs:
             -Algorithm SHA256
 
           "APK_OUTPUT=$output" >> $env:GITHUB_ENV
+
+          Write-Host "APK successfully found: $($apk.FullName)"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
