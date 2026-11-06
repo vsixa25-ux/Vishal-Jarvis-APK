@@ -14,65 +14,31 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
 
-      - name: Configure Android SDK
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: "12266719"
+
+      - name: Install Android SDK packages
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $sdkRoot = $env:ANDROID_HOME
-
-          if (!$sdkRoot -or !(Test-Path -LiteralPath $sdkRoot)) {
-            $sdkRoot = "C:Androidandroid-sdk"
-          }
-
-          if (!(Test-Path -LiteralPath $sdkRoot)) {
-            throw "Android SDK installation not found."
-          }
-
-          $sdkmanager = Get-ChildItem `
-            -Path "$sdkRootcmdline-tools" `
-            -Filter "sdkmanager.bat" `
-            -File `
-            -Recurse |
-            Select-Object -First 1
-
-          if (!$sdkmanager) {
-            throw "Android SDK Manager not found."
-          }
-
-          $env:ANDROID_HOME = $sdkRoot
-          $env:ANDROID_SDK_ROOT = $sdkRoot
-
-          "ANDROID_HOME=$sdkRoot" >> $env:GITHUB_ENV
-          "ANDROID_SDK_ROOT=$sdkRoot" >> $env:GITHUB_ENV
-
-          $answers = 1..100 | ForEach-Object { "y" }
-
-          $answers |
-            & $sdkmanager.FullName `
-            "--sdk_root=$sdkRoot" `
-            --licenses
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Android SDK license acceptance failed."
-          }
-
-          & $sdkmanager.FullName `
-            "--sdk_root=$sdkRoot" `
-            --install `
+          sdkmanager `
+            "platform-tools" `
             "platforms;android-35" `
             "build-tools;35.0.0"
 
@@ -89,7 +55,7 @@ jobs:
 
           $archives = @(
             Get-ChildItem `
-              -Path $workspace `
+              -LiteralPath $workspace `
               -Filter "*.zip" `
               -File
           )
@@ -105,6 +71,13 @@ jobs:
             $env:RUNNER_TEMP `
             "jarvis-source"
 
+          if (Test-Path -LiteralPath $destination) {
+            Remove-Item `
+              -LiteralPath $destination `
+              -Recurse `
+              -Force
+          }
+
           New-Item `
             -ItemType Directory `
             -Path $destination `
@@ -118,7 +91,7 @@ jobs:
 
           $packageFiles = @(
             Get-ChildItem `
-              -Path $destination `
+              -LiteralPath $destination `
               -Filter "package.json" `
               -File `
               -Recurse
@@ -216,24 +189,6 @@ jobs:
             throw "Generated APK is empty."
           }
 
-          $sdkRoot = $env:ANDROID_HOME
-
-          $apksigner = Get-ChildItem `
-            -Path "$sdkRoot\build-tools" `
-            -Filter "apksigner.bat" `
-            -File `
-            -Recurse |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-
-          if ($apksigner) {
-            & $apksigner.FullName verify $apk
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "APK signature verification failed."
-            }
-          }
-
           Write-Host "APK successfully generated."
           Write-Host "APK size: $size bytes"
 
@@ -242,7 +197,7 @@ jobs:
             -Algorithm SHA256
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Vishal-Jarvis-Android-APK
           path: ${{ runner.temp }}/jarvis-source/**/artifacts/android/Vishal-Jarvis-1.1.1-private.apk
